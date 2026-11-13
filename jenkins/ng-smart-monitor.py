@@ -7,10 +7,11 @@ import asyncio
 import logging
 import argparse
 
+from colorama import Fore, Style, init
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 
 import aiohttp
 
@@ -28,6 +29,8 @@ API_CONCURRENCY = 25
 HTTP_TIMEOUT = 60
 
 OUTPUT_DIR = Path("output")
+
+init(autoreset=True)
 
 ##############################################################################
 # Logging
@@ -113,6 +116,11 @@ class ControllerMonitor:
                 return await response.json()
 
     @staticmethod
+    def time_display(seconds):
+        minutes, _seconds = divmod(seconds, 60)
+        return minutes, _seconds, f"{minutes:02d}:{_seconds:02d}"
+
+    @staticmethod
     def utc_now():
         return datetime.now(timezone.utc)
 
@@ -165,10 +173,10 @@ class ControllerMonitor:
                             enter_time=self.utc_now()
                         )
 
-                log.info("Queue depth: %s", len(queue_items))
+                #log.info("Queue depth: %s", len(queue_items))
 
             except Exception:
-                log.exception("Queue sampler failed")
+                log.exception(f"{Fore.RED}Queue sampler failed")
 
             await asyncio.sleep(QUEUE_INTERVAL)
 
@@ -208,7 +216,7 @@ class ControllerMonitor:
                 )
 
             except Exception:
-                log.exception("Executor sampler failed")
+                log.exception(f"{Fore.RED}Executor sampler failed")
 
             await asyncio.sleep(EXECUTOR_INTERVAL)
 
@@ -237,10 +245,7 @@ class ControllerMonitor:
                         job_name        = self.extract_job_name(build_url)
                         build_number    = ce.get("number")
 
-                        build_key = (
-                            job_name,
-                            build_number
-                        )
+                        build_key = (job_name, build_number)
 
                         if build_key in self.state.active_builds:
                             continue
@@ -251,12 +256,12 @@ class ControllerMonitor:
 
                         self.state.active_builds[build_key] = task
 
-                        log.info("Tracking %s #%s", job_name, build_number)
+                        log.info(f"Tracking {Fore.CYAN}{unquote(unquote(job_name))}{Style.RESET_ALL} #{build_number}")
 
                 await self.harvest_finished()
 
             except Exception:
-                log.exception("Discovery failure")
+                log.exception(f"{Fore.RED}Discovery failure")
 
             await asyncio.sleep(DISCOVERY_INTERVAL)
 
@@ -269,31 +274,41 @@ class ControllerMonitor:
             while True:
                 active      = len(self.state.active_builds)
                 completed   = len(self.state.completed_builds)
+                queue_depth = self.state.queue_samples[-1].depth if self.state.queue_samples else 0
                 elapsed     = int(time.time() - self.start_time)
 
                 if not self.stop_event.is_set():
                     remaining   = max(0, self.duration - elapsed)
-                    phase       = "MONITORING"
+                    phase       = f"{Fore.BLUE}MONITORING{Style.RESET_ALL}"
                 else:
                     remaining   = max(0, self.drain_time - elapsed)
-                    phase       = "DRAINING"
+                    phase       = f"{Fore.YELLOW}DRAINING{Style.RESET_ALL}"
 
-                mins, secs = divmod(remaining, 60)
-                log.info(f" --> [{phase}] Build Tracking: active: {active}, completed: {completed}, remaining: {mins:02d}:{secs:02d}")
+                mins, _, display_time = self.time_display(remaining)
+
+                if mins >= 10:
+                    time_str = f"{Fore.GREEN}{display_time}"
+                elif mins >= 3:
+                    time_str = f"{Fore.YELLOW}{display_time}"
+                else:
+                    time_str = f"{Fore.RED}{display_time}"
+
+                log.info(
+                    f" --> [{phase}] "
+                    f"Active: {Style.BRIGHT}{active}{Style.RESET_ALL}, "
+                    f"Completed: {Style.BRIGHT}{completed}{Style.RESET_ALL}, "
+                    f"Queue Depth: {Style.BRIGHT}{queue_depth}{Style.RESET_ALL}, "
+                    f"Remaining: {time_str}{Style.RESET_ALL}"
+                )
 
                 await asyncio.sleep(TRACKING_INTERVAL)
 
         except asyncio.CancelledError:
-            log.info("Stats monitor stopped")
+            log.info(f"{Fore.RED}Stats monitor stopped")
             raise
 
     async def fetch_build_stats(self, session, build_url):
-        tree = ("building,"
-            "result,"
-            "duration,"
-            "timestamp,"
-            "number")
-
+        tree = "building,result,duration,timestamp,number"
         url = f"{build_url.rstrip('/')}/api/json?tree={tree}"
 
         return await self.get_json(session, url)
@@ -347,13 +362,20 @@ class ControllerMonitor:
                 record = task.result()
                 self.state.completed_builds.append(record)
 
-                log.info("Completed: %s #%s (%s)", record.job_name, record.build_number, record.result)
+                if record.result == 'SUCCESS':
+                    result = f"{Fore.GREEN}SUCCESS{Style.RESET_ALL}"
+                elif record.result == 'FAILURE':
+                    result = f"{Fore.RED}FAILURE{Style.RESET_ALL}"
+                else:
+                    result = f"{Fore.YELLOW}{record.result}{Style.RESET_ALL}"
+
+                log.info(f"Completed: {Fore.CYAN}{unquote(unquote(record.job_name))}{Style.RESET_ALL} #{record.build_number} ({result})")
 
             except asyncio.CancelledError:
                 pass
 
             except Exception:
-                log.exception("Build monitor failed")
+                log.exception(f"{Fore.RED}Build monitor failed")
 
         for key in completed:
             self.state.active_builds.pop(key, None)
@@ -420,14 +442,13 @@ class ControllerMonitor:
 
         avg_runtime = (
             sum(b.runtime_seconds for b in builds) / total
-            if total
-            else 0
+            if total else 0
         )
+        _, _, display_time = self.time_display(avg_runtime)
 
         avg_queue_depth = (
             sum(q.depth for q in self.state.queue_samples) / len(self.state.queue_samples)
-            if self.state.queue_samples
-            else 0
+            if self.state.queue_samples else 0
         )
 
         peak_utilization = max(
@@ -435,15 +456,15 @@ class ControllerMonitor:
         )
 
         print()
-        print("============================")
-        print("Controller Summary")
-        print("============================")
-        print(f"Builds Observed : {total}")
-        print(f"Successes       : {success}")
-        print(f"Failures        : {failures}")
-        print(f"Avg Runtime(s)  : {avg_runtime:.1f}")
-        print(f"Avg Queue Depth : {avg_queue_depth:.2f}")
-        print(f"Peak Utilization: {peak_utilization:.1f}%")
+        print(f"{Style.BRIGHT}============================")
+        print(f"{Style.BRIGHT}Controller Summary")
+        print(f"{Style.BRIGHT}============================")
+        print(f"{Style.BRIGHT}Builds Observed{Style.RESET_ALL} : {total}")
+        print(f"{Style.BRIGHT}Successes{Style.RESET_ALL}       : {success}")
+        print(f"{Style.BRIGHT}Failures{Style.RESET_ALL}        : {failures}")
+        print(f"{Style.BRIGHT}Avg Runtime(s){Style.RESET_ALL}  : {display_time}")
+        print(f"{Style.BRIGHT}Avg Queue Depth{Style.RESET_ALL} : {avg_queue_depth:.2f}")
+        print(f"{Style.BRIGHT}Peak Utilization{Style.RESET_ALL}: {peak_utilization:.1f}%")
 
     ##########################################################################
     # Main Runner
@@ -462,7 +483,7 @@ class ControllerMonitor:
             try:
                 await asyncio.sleep(self.duration)
 
-                log.info("Stopping discovery...")
+                log.info(f"{Fore.YELLOW}Stopping discovery...")
                 self.stop_event.set()
 
                 await queue_task
@@ -470,7 +491,7 @@ class ControllerMonitor:
                 await discovery_task
 
                 if self.state.active_builds:
-                    log.info("Draining %s active builds", len(self.state.active_builds))
+                    log.info(f"Draining {Fore.YELLOW}{len(self.state.active_builds)}{Style.RESET_ALL} active builds")
                     self.start_time = time.time()
 
                     try:
@@ -478,13 +499,13 @@ class ControllerMonitor:
                             asyncio.gather(*self.state.active_builds.values()), timeout=self.drain_time
                         )
                     except asyncio.TimeoutError:
-                        log.warning("Drain timeout exceeded")
+                        log.warning(f"{Fore.YELLOW}Drain timeout exceeded")
                         for task in self.state.active_builds.values():
                             task.cancel()
                         await asyncio.gather(*self.state.active_builds.values(), return_exceptions=True)
 
             except asyncio.CancelledError:
-                log.warning("Ctrl-C detected — stopping samplers early and saving collected data...")
+                log.warning(f"{Fore.YELLOW}Ctrl-C detected — stopping samplers early and saving collected data...")
                 self.stop_event.set()
                 background_tasks = [
                     queue_task,
